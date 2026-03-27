@@ -1,0 +1,17 @@
+{
+  "name": "nibiru-rpc-listener",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "node-fetch": "^2.7.0",
+    "pg": "^8.20.0"
+  }
+}
