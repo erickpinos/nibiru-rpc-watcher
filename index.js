@@ -30,14 +30,42 @@ async function initDb() {
       response_time_ms INT,
       status_code INT,
       is_healthy BOOLEAN NOT NULL,
-      error TEXT
+      error TEXT,
+      uptime_24h NUMERIC(5,2)
     )
+  `);
+  // Add column if table already existed without it
+  await pool.query(`
+    ALTER TABLE rpc_health_logs
+    ADD COLUMN IF NOT EXISTS uptime_24h NUMERIC(5,2)
   `);
   console.log("Database table ready");
 }
 
+// --- Uptime ---
+async function getUptime24h() {
+  try {
+    const { rows } = await pool.query(`
+      SELECT
+        COUNT(*) FILTER (WHERE is_healthy) AS healthy,
+        COUNT(*) AS total
+      FROM rpc_health_logs
+      WHERE timestamp > NOW() - INTERVAL '24 hours'
+    `);
+    const { healthy, total } = rows[0];
+    if (total === "0") return null;
+    return parseFloat(((parseInt(healthy) / parseInt(total)) * 100).toFixed(2));
+  } catch {
+    return null;
+  }
+}
+
 // --- Telegram ---
-async function sendTelegramAlert(message) {
+async function sendTelegramAlert(message, uptime) {
+  const uptimeLine = uptime !== null && uptime !== undefined
+    ? `\nUptime (24h): \`${uptime}%\``
+    : "";
+  message = message + uptimeLine;
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
     console.warn("Telegram not configured, skipping alert");
     return;
@@ -95,6 +123,7 @@ async function poll() {
   }
 
   const responseTime = Date.now() - start;
+  const uptime = await getUptime24h();
 
   // Stall detection
   if (blockHeight !== null && lastBlockHeight !== null) {
@@ -103,7 +132,8 @@ async function poll() {
     } else {
       if (stallCount >= STALL_THRESHOLD_CHECKS && alertSent) {
         await sendTelegramAlert(
-          `✅ *Nibiru Archive Node Recovered*\nBlock height advancing again: \`${blockHeight}\``
+          `✅ *Nibiru Archive Node Recovered*\nBlock height advancing again: \`${blockHeight}\``,
+          uptime
         );
         alertSent = false;
       }
@@ -118,7 +148,8 @@ async function poll() {
   // Alert on stall
   if (stallCount >= STALL_THRESHOLD_CHECKS && !alertSent) {
     await sendTelegramAlert(
-      `⚠️ *Nibiru Archive Node Stalled*\nBlock height stuck at \`${blockHeight}\` for ${stallCount} consecutive checks (${(stallCount * POLL_INTERVAL_MS) / 1000}s)`
+      `⚠️ *Nibiru Archive Node Stalled*\nBlock height stuck at \`${blockHeight}\` for ${stallCount} consecutive checks (${(stallCount * POLL_INTERVAL_MS) / 1000}s)`,
+      uptime
     );
     alertSent = true;
   }
@@ -126,7 +157,8 @@ async function poll() {
   // Alert on down
   if (!isHealthy && !alertSent) {
     await sendTelegramAlert(
-      `🔴 *Nibiru Archive Node Down*\nEndpoint: \`${RPC_URL}\`\nError: ${error || "Unknown"}`
+      `🔴 *Nibiru Archive Node Down*\nEndpoint: \`${RPC_URL}\`\nError: ${error || "Unknown"}`,
+      uptime
     );
     alertSent = true;
   }
@@ -134,7 +166,8 @@ async function poll() {
   // Recovery from down
   if (isHealthy && alertSent && stallCount < STALL_THRESHOLD_CHECKS) {
     await sendTelegramAlert(
-      `✅ *Nibiru Archive Node Back Online*\nBlock height: \`${blockHeight}\``
+      `✅ *Nibiru Archive Node Back Online*\nBlock height: \`${blockHeight}\``,
+      uptime
     );
     alertSent = false;
   }
@@ -142,9 +175,9 @@ async function poll() {
   // Log to DB
   try {
     await pool.query(
-      `INSERT INTO rpc_health_logs (block_height, response_time_ms, status_code, is_healthy, error)
-       VALUES ($1, $2, $3, $4, $5)`,
-      [blockHeight, responseTime, statusCode, isHealthy, error]
+      `INSERT INTO rpc_health_logs (block_height, response_time_ms, status_code, is_healthy, error, uptime_24h)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [blockHeight, responseTime, statusCode, isHealthy, error, uptime]
     );
   } catch (dbErr) {
     console.error("DB write failed:", dbErr.message);
