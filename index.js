@@ -1,5 +1,6 @@
 const fetch = require("node-fetch");
 const { Pool } = require("pg");
+const TelegramBot = require("node-telegram-bot-api");
 
 // --- Config ---
 const RPC_URL = process.env.RPC_URL || "https://evm-rpc.archive.nibiru.fi";
@@ -19,6 +20,7 @@ const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorize
 let lastBlockHeight = null;
 let stallCount = 0;
 let alertSent = false;
+const processStartTime = Date.now();
 
 // --- DB Setup ---
 async function initDb() {
@@ -189,6 +191,109 @@ async function poll() {
   );
 }
 
+// --- Status Query ---
+async function getNodeStatus() {
+  const uptime = await getUptime24h();
+
+  // Recent stats from last 10 polls
+  const { rows: recentLogs } = await pool.query(`
+    SELECT block_height, response_time_ms, is_healthy, timestamp
+    FROM rpc_health_logs
+    ORDER BY timestamp DESC
+    LIMIT 10
+  `);
+
+  // Stats from last hour
+  const { rows: hourStats } = await pool.query(`
+    SELECT
+      COUNT(*) AS total,
+      COUNT(*) FILTER (WHERE is_healthy) AS healthy,
+      ROUND(AVG(response_time_ms)) AS avg_response,
+      MIN(response_time_ms) AS min_response,
+      MAX(response_time_ms) AS max_response,
+      MAX(block_height) AS max_block,
+      MIN(block_height) AS min_block
+    FROM rpc_health_logs
+    WHERE timestamp > NOW() - INTERVAL '1 hour'
+  `);
+
+  const h = hourStats[0] || {};
+  const latest = recentLogs[0];
+  const currentlyHealthy = latest ? latest.is_healthy : null;
+  const currentBlock = latest ? latest.block_height : null;
+
+  // Process uptime
+  const uptimeMs = Date.now() - processStartTime;
+  const uptimeDays = Math.floor(uptimeMs / 86400000);
+  const uptimeHours = Math.floor((uptimeMs % 86400000) / 3600000);
+  const uptimeMins = Math.floor((uptimeMs % 3600000) / 60000);
+  const processUptimeStr = `${uptimeDays}d ${uptimeHours}h ${uptimeMins}m`;
+
+  // Blocks advanced in last hour
+  const blocksAdvanced = h.max_block && h.min_block
+    ? parseInt(h.max_block) - parseInt(h.min_block)
+    : "N/A";
+
+  const statusEmoji = currentlyHealthy ? "🟢" : "🔴";
+  const stallStatus = stallCount > 0 ? `⚠️ ${stallCount} stall checks` : "✅ Advancing normally";
+
+  return [
+    `${statusEmoji} *Nibiru Archive Node Status*`,
+    ``,
+    `*Current State*`,
+    `Health: ${currentlyHealthy ? "Online" : "Offline"}`,
+    `Block Height: \`${currentBlock || "N/A"}\``,
+    `Block Stall: ${stallStatus}`,
+    ``,
+    `*Last Hour Stats*`,
+    `Checks: ${h.total || 0} (${h.healthy || 0} healthy)`,
+    `Avg Response: \`${h.avg_response || "N/A"}ms\``,
+    `Min / Max: \`${h.min_response || "N/A"}ms\` / \`${h.max_response || "N/A"}ms\``,
+    `Blocks Advanced: \`${blocksAdvanced}\``,
+    ``,
+    `*Uptime*`,
+    `24h Uptime: \`${uptime !== null ? uptime + "%" : "N/A"}\``,
+    `Monitor Uptime: \`${processUptimeStr}\``,
+    `Endpoint: \`${RPC_URL}\``,
+  ].join("\n");
+}
+
+// --- Telegram Bot ---
+function startTelegramBot() {
+  if (!TELEGRAM_BOT_TOKEN) {
+    console.warn("Telegram bot not started: TELEGRAM_BOT_TOKEN not configured");
+    return;
+  }
+
+  const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
+
+  bot.onText(/\/status/, async (msg) => {
+    try {
+      const status = await getNodeStatus();
+      await bot.sendMessage(msg.chat.id, status, { parse_mode: "Markdown" });
+    } catch (err) {
+      console.error("Error handling /status command:", err.message);
+      await bot.sendMessage(msg.chat.id, "❌ Error fetching node status. Please try again.");
+    }
+  });
+
+  bot.onText(/\/help/, async (msg) => {
+    const help = [
+      "*Nibiru RPC Monitor Bot*",
+      "",
+      `/status - Get current node status and stats`,
+      `/help - Show this help message`,
+    ].join("\n");
+    await bot.sendMessage(msg.chat.id, help, { parse_mode: "Markdown" });
+  });
+
+  bot.on("polling_error", (err) => {
+    console.error("Telegram polling error:", err.message);
+  });
+
+  console.log("Telegram bot started, listening for /status commands");
+}
+
 // --- Main ---
 async function main() {
   console.log(`Nibiru RPC Listener starting`);
@@ -197,6 +302,7 @@ async function main() {
   console.log(`Stall threshold: ${STALL_THRESHOLD_CHECKS} checks`);
 
   await initDb();
+  startTelegramBot();
 
   // Initial poll
   await poll();
