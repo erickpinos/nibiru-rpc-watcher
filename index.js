@@ -202,7 +202,28 @@ async function poll() {
     consecutiveFailures++;
   }
 
+  // Log to DB before calculating uptime so the current check is included
+  try {
+    await pool.query(
+      `INSERT INTO rpc_health_logs (block_height, response_time_ms, status_code, is_healthy, error)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [blockHeight, responseTime, statusCode, isHealthy, error]
+    );
+  } catch (dbErr) {
+    console.error("DB write failed:", dbErr.message);
+  }
+
   const uptime = await getUptime24h();
+
+  // Update the uptime value on the row we just inserted
+  try {
+    await pool.query(`
+      UPDATE rpc_health_logs SET uptime_24h = $1
+      WHERE id = (SELECT MAX(id) FROM rpc_health_logs)
+    `, [uptime]);
+  } catch (dbErr) {
+    console.error("DB uptime update failed:", dbErr.message);
+  }
 
   // Stall detection
   if (blockHeight !== null && lastBlockHeight !== null) {
@@ -250,17 +271,6 @@ async function poll() {
       uptime
     );
     alertSent = false;
-  }
-
-  // Log to DB
-  try {
-    await pool.query(
-      `INSERT INTO rpc_health_logs (block_height, response_time_ms, status_code, is_healthy, error, uptime_24h)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
-      [blockHeight, responseTime, statusCode, isHealthy, error, uptime]
-    );
-  } catch (dbErr) {
-    console.error("DB write failed:", dbErr.message);
   }
 
   const status = isHealthy ? "✓" : "✗";
