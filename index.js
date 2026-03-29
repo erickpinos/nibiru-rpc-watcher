@@ -21,6 +21,8 @@ let lastBlockHeight = null;
 let stallCount = 0;
 let alertSent = false;
 let consecutiveFailures = 0;
+let alertsMuted = false;
+let muteUntil = null;
 const processStartTime = Date.now();
 
 // --- Error Classification ---
@@ -144,6 +146,16 @@ async function getUptime24h() {
 }
 
 // --- Telegram ---
+function isAlertsMuted() {
+  if (!alertsMuted) return false;
+  if (muteUntil && Date.now() > muteUntil) {
+    alertsMuted = false;
+    muteUntil = null;
+    return false;
+  }
+  return true;
+}
+
 async function sendTelegramAlert(message, uptime) {
   const uptimeLine = uptime !== null && uptime !== undefined
     ? `\nUptime (24h): \`${uptime}%\``
@@ -151,6 +163,10 @@ async function sendTelegramAlert(message, uptime) {
   message = message + uptimeLine;
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
     console.warn("Telegram not configured, skipping alert");
+    return;
+  }
+  if (isAlertsMuted()) {
+    console.log("Alert muted, skipping");
     return;
   }
   try {
@@ -421,62 +437,252 @@ function startTelegramBot() {
     }
   });
 
-  bot.onText(/\/block(?:\s+(\d+))?/, async (msg, match) => {
+  bot.onText(/\/error(?:\s+(\d+))?/, async (msg, match) => {
     try {
-      const blockNum = match[1] ? parseInt(match[1], 10) : null;
+      const n = match[1] ? parseInt(match[1], 10) : 1;
 
-      if (!blockNum) {
-        await bot.sendMessage(msg.chat.id, "Usage: `/block <number>`\nExample: `/block 12345678`", { parse_mode: "Markdown" });
-        return;
-      }
-
-      // Check if we've ever seen this block in our logs
       const { rows } = await pool.query(`
-        SELECT block_height, response_time_ms, status_code, is_healthy, error, timestamp, uptime_24h
+        SELECT error, status_code, response_time_ms, block_height, timestamp
         FROM rpc_health_logs
-        WHERE block_height = $1
+        WHERE error IS NOT NULL
         ORDER BY timestamp DESC
-      `, [blockNum]);
+        LIMIT $1
+      `, [n]);
 
       if (rows.length === 0) {
-        await bot.sendMessage(msg.chat.id, `❌ Block \`${blockNum}\` was never observed by this monitor. Can only look up blocks that were seen during health checks.`, { parse_mode: "Markdown" });
+        await bot.sendMessage(msg.chat.id, "✅ No errors recorded yet.", { parse_mode: "Markdown" });
         return;
       }
 
-      const first = rows[rows.length - 1];
-      const last = rows[0];
-      const healthyCount = rows.filter(r => r.is_healthy).length;
-      const errorCount = rows.filter(r => !r.is_healthy).length;
-      const avgResponse = Math.round(rows.reduce((sum, r) => sum + (r.response_time_ms || 0), 0) / rows.length);
+      const row = rows[rows.length - 1]; // nth most recent
+      const classification = classifyError({ error: row.error, statusCode: row.status_code });
+      const type = classification ? classification.category : "UNKNOWN";
+      const diagnosis = classification ? classification.diagnosis : "N/A";
+      const ago = timeSince(new Date(row.timestamp));
 
       const lines = [
-        `📦 *Block ${blockNum} Status*`,
+        `🔍 *Error #${n}* (${ago} ago)`,
         ``,
-        `*Observations*`,
-        `Times seen: \`${rows.length}\``,
-        `Healthy: \`${healthyCount}\` | Errors: \`${errorCount}\``,
-        `Avg Response: \`${avgResponse}ms\``,
+        `*Classification*`,
+        `Type: \`${type}\``,
+        `Diagnosis: ${diagnosis}`,
         ``,
-        `*Timeline*`,
-        `First seen: \`${new Date(first.timestamp).toISOString()}\``,
-        `Last seen: \`${new Date(last.timestamp).toISOString()}\` (${timeSince(new Date(last.timestamp))} ago)`,
+        `*Full Error*`,
+        `\`${row.error}\``,
+        ``,
+        `*Context*`,
+        `HTTP Status: \`${row.status_code || "N/A"}\``,
+        `Response Time: \`${row.response_time_ms}ms\``,
+        `Block Height: \`${row.block_height || "N/A"}\``,
+        `Timestamp: \`${new Date(row.timestamp).toISOString()}\``,
       ];
-
-      if (errorCount > 0) {
-        const errors = rows.filter(r => r.error);
-        const uniqueErrors = [...new Set(errors.map(r => r.error))];
-        lines.push(``, `*Errors at this block*`);
-        uniqueErrors.forEach(e => {
-          const classification = classifyError({ error: e, statusCode: null });
-          const type = classification ? classification.category : "UNKNOWN";
-          lines.push(`• \`${type}\`: ${e.length > 80 ? e.slice(0, 80) + "..." : e}`);
-        });
-      }
 
       await bot.sendMessage(msg.chat.id, lines.join("\n"), { parse_mode: "Markdown" });
     } catch (err) {
-      console.error("Error handling /block command:", err.message);
-      await bot.sendMessage(msg.chat.id, "❌ Error fetching block info. Please try again.");
+      console.error("Error handling /error command:", err.message);
+      await bot.sendMessage(msg.chat.id, "❌ Error fetching error detail. Please try again.");
+    }
+  });
+
+  bot.onText(/\/ping/, async (msg) => {
+    try {
+      const start = Date.now();
+      let pingStatus, pingError, pingStatusCode;
+
+      try {
+        const res = await fetch(RPC_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ jsonrpc: "2.0", method: "eth_blockNumber", params: [], id: 1 }),
+          timeout: 10000,
+        });
+        pingStatusCode = res.status;
+        const data = await res.json();
+        if (data.result) {
+          const block = parseInt(data.result, 16);
+          pingStatus = `🟢 Online — Block \`${block}\``;
+        } else {
+          pingError = data.error ? JSON.stringify(data.error) : "No result";
+          pingStatus = `🔴 Error`;
+        }
+      } catch (err) {
+        pingError = err.message;
+        pingStatus = `🔴 Unreachable`;
+      }
+
+      const responseTime = Date.now() - start;
+      const classification = pingError ? classifyError({ error: pingError, statusCode: pingStatusCode }) : null;
+
+      const lines = [
+        `🏓 *Ping Result*`,
+        ``,
+        `Status: ${pingStatus}`,
+        `Response Time: \`${responseTime}ms\``,
+      ];
+
+      if (pingStatusCode) lines.push(`HTTP Status: \`${pingStatusCode}\``);
+      if (pingError) lines.push(`Error: \`${pingError}\``);
+      if (classification) lines.push(`Type: \`${classification.category}\``);
+
+      lines.push(``, `Endpoint: \`${RPC_URL}\``);
+
+      await bot.sendMessage(msg.chat.id, lines.join("\n"), { parse_mode: "Markdown" });
+    } catch (err) {
+      console.error("Error handling /ping command:", err.message);
+      await bot.sendMessage(msg.chat.id, "❌ Ping failed. Please try again.");
+    }
+  });
+
+  bot.onText(/\/uptime/, async (msg) => {
+    try {
+      const intervals = [
+        ["1 hour", "1h"],
+        ["6 hours", "6h"],
+        ["24 hours", "24h"],
+        ["7 days", "7d"],
+      ];
+
+      const lines = [`📊 *Uptime Breakdown*`, ``];
+
+      for (const [interval, label] of intervals) {
+        const { rows } = await pool.query(`
+          SELECT
+            COUNT(*) FILTER (WHERE is_healthy) AS healthy,
+            COUNT(*) AS total
+          FROM rpc_health_logs
+          WHERE timestamp > NOW() - INTERVAL '${interval}'
+        `);
+        const { healthy, total } = rows[0];
+        if (total === "0") {
+          lines.push(`${label}: \`No data\``);
+        } else {
+          const pct = ((parseInt(healthy) / parseInt(total)) * 100).toFixed(2);
+          lines.push(`${label}: \`${pct}%\` (${healthy}/${total} checks)`);
+        }
+      }
+
+      // Process uptime
+      const uptimeMs = Date.now() - processStartTime;
+      const uptimeDays = Math.floor(uptimeMs / 86400000);
+      const uptimeHours = Math.floor((uptimeMs % 86400000) / 3600000);
+      const uptimeMins = Math.floor((uptimeMs % 3600000) / 60000);
+      lines.push(``, `Monitor running: \`${uptimeDays}d ${uptimeHours}h ${uptimeMins}m\``);
+
+      await bot.sendMessage(msg.chat.id, lines.join("\n"), { parse_mode: "Markdown" });
+    } catch (err) {
+      console.error("Error handling /uptime command:", err.message);
+      await bot.sendMessage(msg.chat.id, "❌ Error fetching uptime. Please try again.");
+    }
+  });
+
+  bot.onText(/\/last(?:\s+(\d+))?/, async (msg, match) => {
+    try {
+      const n = Math.min(parseInt(match[1] || "5", 10), 20);
+
+      const { rows } = await pool.query(`
+        SELECT block_height, response_time_ms, status_code, is_healthy, error, timestamp
+        FROM rpc_health_logs
+        ORDER BY timestamp DESC
+        LIMIT $1
+      `, [n]);
+
+      if (rows.length === 0) {
+        await bot.sendMessage(msg.chat.id, "No logs yet.", { parse_mode: "Markdown" });
+        return;
+      }
+
+      const lines = [`📋 *Last ${rows.length} Checks*`, ``];
+
+      rows.forEach(row => {
+        const icon = row.is_healthy ? "✅" : "🔴";
+        const ago = timeSince(new Date(row.timestamp));
+        const block = row.block_height || "—";
+        const errSnip = row.error
+          ? ` \`${row.error.length > 50 ? row.error.slice(0, 50) + "..." : row.error}\``
+          : "";
+        lines.push(`${icon} ${ago} ago | blk \`${block}\` | \`${row.response_time_ms}ms\`${errSnip}`);
+      });
+
+      await bot.sendMessage(msg.chat.id, lines.join("\n"), { parse_mode: "Markdown" });
+    } catch (err) {
+      console.error("Error handling /last command:", err.message);
+      await bot.sendMessage(msg.chat.id, "❌ Error fetching logs. Please try again.");
+    }
+  });
+
+  bot.onText(/\/mute(?:\s+(\d+))?/, async (msg, match) => {
+    const minutes = parseInt(match[1] || "60", 10);
+    alertsMuted = true;
+    muteUntil = Date.now() + minutes * 60 * 1000;
+    await bot.sendMessage(msg.chat.id, `🔇 Alerts muted for \`${minutes}\` minutes.\nUse /unmute to re-enable.`, { parse_mode: "Markdown" });
+  });
+
+  bot.onText(/\/unmute/, async (msg) => {
+    alertsMuted = false;
+    muteUntil = null;
+    await bot.sendMessage(msg.chat.id, `🔔 Alerts re-enabled.`, { parse_mode: "Markdown" });
+  });
+
+  bot.onText(/\/response/, async (msg) => {
+    try {
+      const { rows } = await pool.query(`
+        SELECT
+          interval_label,
+          ROUND(avg_ms) AS avg_ms,
+          min_ms,
+          max_ms,
+          ROUND(p95_ms) AS p95_ms,
+          total
+        FROM (
+          SELECT
+            '1h' AS interval_label, 1 AS sort_order,
+            AVG(response_time_ms) AS avg_ms,
+            MIN(response_time_ms) AS min_ms,
+            MAX(response_time_ms) AS max_ms,
+            PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY response_time_ms) AS p95_ms,
+            COUNT(*) AS total
+          FROM rpc_health_logs WHERE timestamp > NOW() - INTERVAL '1 hour'
+          UNION ALL
+          SELECT
+            '24h', 2,
+            AVG(response_time_ms),
+            MIN(response_time_ms),
+            MAX(response_time_ms),
+            PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY response_time_ms),
+            COUNT(*)
+          FROM rpc_health_logs WHERE timestamp > NOW() - INTERVAL '24 hours'
+          UNION ALL
+          SELECT
+            '7d', 3,
+            AVG(response_time_ms),
+            MIN(response_time_ms),
+            MAX(response_time_ms),
+            PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY response_time_ms),
+            COUNT(*)
+          FROM rpc_health_logs WHERE timestamp > NOW() - INTERVAL '7 days'
+        ) sub
+        ORDER BY sort_order
+      `);
+
+      const lines = [`⏱ *Response Time Stats*`, ``];
+
+      rows.forEach(r => {
+        if (parseInt(r.total) === 0) {
+          lines.push(`*${r.interval_label}*: No data`, ``);
+        } else {
+          lines.push(
+            `*${r.interval_label}* (${r.total} checks)`,
+            `Avg: \`${r.avg_ms}ms\` | P95: \`${r.p95_ms}ms\``,
+            `Min: \`${r.min_ms}ms\` | Max: \`${r.max_ms}ms\``,
+            ``
+          );
+        }
+      });
+
+      await bot.sendMessage(msg.chat.id, lines.join("\n"), { parse_mode: "Markdown" });
+    } catch (err) {
+      console.error("Error handling /response command:", err.message);
+      await bot.sendMessage(msg.chat.id, "❌ Error fetching response stats. Please try again.");
     }
   });
 
@@ -508,15 +714,30 @@ function startTelegramBot() {
   });
 
   bot.onText(/\/help/, async (msg) => {
+    const muteStatus = isAlertsMuted()
+      ? `\n\n🔇 _Alerts muted until ${new Date(muteUntil).toISOString()}_`
+      : "";
     const help = [
       "*Nibiru RPC Monitor Bot*",
       "",
-      `/status - Get current node status and stats`,
-      `/errors - List all error types from the last 24h`,
-      `/block <number> - Look up status of a specific block`,
-      `/errortypes - Show all possible error categories`,
-      `/help - Show this help message`,
-    ].join("\n");
+      `*Monitoring*`,
+      `/status - Current node status and stats`,
+      `/ping - Live check right now`,
+      `/uptime - Uptime breakdown (1h, 6h, 24h, 7d)`,
+      `/response - Response time stats with P95`,
+      ``,
+      `*Errors*`,
+      `/errors - Error summary from the last 24h`,
+      `/error <n> - Full detail of nth most recent error`,
+      `/errortypes - Reference of all error categories`,
+      ``,
+      `*Logs*`,
+      `/last <n> - Last n health checks (default 5, max 20)`,
+      ``,
+      `*Alerts*`,
+      `/mute <min> - Mute alerts for n minutes (default 60)`,
+      `/unmute - Re-enable alerts`,
+    ].join("\n") + muteStatus;
     await bot.sendMessage(msg.chat.id, help, { parse_mode: "Markdown" });
   });
 
