@@ -16,6 +16,7 @@ if (!DATABASE_URL) {
 }
 
 const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
+pool.on("error", (err) => console.error("Unexpected pool error:", err.message));
 
 let lastBlockHeight = null;
 let stallCount = 0;
@@ -24,7 +25,7 @@ let consecutiveFailures = 0;
 const processStartTime = Date.now();
 
 // --- Error Classification ---
-function classifyError({ error, statusCode, responseTime }) {
+function classifyError({ error, statusCode }) {
   if (!error && statusCode && statusCode >= 200 && statusCode < 300) {
     return null; // No error
   }
@@ -64,7 +65,7 @@ function classifyError({ error, statusCode, responseTime }) {
   return { category, diagnosis };
 }
 
-function formatDetailedError({ error, statusCode, responseTime, uptime, consecutiveFailures }) {
+function formatDetailedError({ error, statusCode, responseTime, consecutiveFailures }) {
   const classification = classifyError({ error, statusCode, responseTime });
   if (!classification) return null;
 
@@ -136,9 +137,10 @@ async function getUptime24h() {
       WHERE timestamp > NOW() - INTERVAL '24 hours'
     `);
     const { healthy, total } = rows[0];
-    if (total === "0") return null;
+    if (parseInt(total) === 0) return null;
     return parseFloat(((parseInt(healthy) / parseInt(total)) * 100).toFixed(2));
-  } catch {
+  } catch (err) {
+    console.error("getUptime24h query failed:", err.message);
     return null;
   }
 }
@@ -148,24 +150,29 @@ async function sendTelegramAlert(message, uptime) {
   const uptimeLine = uptime !== null && uptime !== undefined
     ? `\nUptime (24h): \`${uptime}%\``
     : "";
-  message = message + uptimeLine;
+  const fullMessage = message + uptimeLine;
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
     console.warn("Telegram not configured, skipping alert");
     return;
   }
   try {
-    await fetch(
+    const res = await fetch(
       `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           chat_id: TELEGRAM_CHAT_ID,
-          text: message,
+          text: fullMessage,
           parse_mode: "Markdown",
         }),
+        timeout: 5000,
       }
     );
+    const data = await res.json();
+    if (!data.ok) {
+      console.error(`Telegram API error: ${data.error_code} - ${data.description}`);
+    }
   } catch (err) {
     console.error("Failed to send Telegram alert:", err.message);
   }
@@ -214,12 +221,14 @@ async function poll() {
   }
 
   // Log to DB before calculating uptime so the current check is included
+  let insertedId = null;
   try {
-    await pool.query(
+    const { rows: insertedRows } = await pool.query(
       `INSERT INTO rpc_health_logs (block_height, response_time_ms, status_code, is_healthy, error)
-       VALUES ($1, $2, $3, $4, $5)`,
+       VALUES ($1, $2, $3, $4, $5) RETURNING id`,
       [blockHeight, responseTime, statusCode, isHealthy, error]
     );
+    insertedId = insertedRows[0].id;
   } catch (dbErr) {
     console.error("DB write failed:", dbErr.message);
   }
@@ -227,13 +236,15 @@ async function poll() {
   const uptime = await getUptime24h();
 
   // Update the uptime value on the row we just inserted
-  try {
-    await pool.query(`
-      UPDATE rpc_health_logs SET uptime_24h = $1
-      WHERE id = (SELECT MAX(id) FROM rpc_health_logs)
-    `, [uptime]);
-  } catch (dbErr) {
-    console.error("DB uptime update failed:", dbErr.message);
+  if (insertedId !== null) {
+    try {
+      await pool.query(
+        `UPDATE rpc_health_logs SET uptime_24h = $1 WHERE id = $2`,
+        [uptime, insertedId]
+      );
+    } catch (dbErr) {
+      console.error("DB uptime update failed:", dbErr.message);
+    }
   }
 
   // Stall detection
@@ -267,7 +278,7 @@ async function poll() {
 
   // Alert on down
   if (!isHealthy && !alertSent) {
-    const detailedMsg = formatDetailedError({ error, statusCode, responseTime, uptime, consecutiveFailures });
+    const detailedMsg = formatDetailedError({ error, statusCode, responseTime, consecutiveFailures });
     await sendTelegramAlert(
       detailedMsg || `🔴 *Nibiru Node Down*\nEndpoint: \`${RPC_URL}\`\nError: ${error || "Unknown"}`,
       uptime
@@ -537,11 +548,31 @@ async function main() {
   await initDb();
   startTelegramBot();
 
+  // Graceful shutdown
+  async function shutdown() {
+    console.log("Shutting down gracefully...");
+    await pool.end();
+    process.exit(0);
+  }
+  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", shutdown);
+
   // Initial poll
   await poll();
 
-  // Schedule recurring polls
-  setInterval(poll, POLL_INTERVAL_MS);
+  // Schedule recurring polls, guarded against concurrent execution
+  let isPolling = false;
+  setInterval(async () => {
+    if (isPolling) return;
+    isPolling = true;
+    try {
+      await poll();
+    } catch (err) {
+      console.error("Poll error:", err.message);
+    } finally {
+      isPolling = false;
+    }
+  }, POLL_INTERVAL_MS);
 }
 
 main().catch((err) => {
