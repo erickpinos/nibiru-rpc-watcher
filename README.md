@@ -1,4 +1,4 @@
-# nibiru-rpc-listener
+# nibiru-rpc-watcher
 
 Monitors the Nibiru RPC node (``) for uptime, block height stalls, and response time. Logs to Neon and alerts via Telegram.
 
@@ -13,7 +13,7 @@ Monitors the Nibiru RPC node (``) for uptime, block height stalls, and response 
 
 ### 1. Neon
 
-Already created: project `nibiru-rpc-listener` (`lively-salad-82750848`). The table is auto-created on first run.
+Already created: project `nibiru-rpc-watcher` (`lively-salad-82750848`). The table is auto-created on first run.
 
 ### 2. Telegram Bot
 

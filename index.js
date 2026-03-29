@@ -761,7 +761,7 @@ function startTelegramBot() {
 
 // --- Main ---
 async function main() {
-  console.log(`Nibiru RPC Listener starting`);
+  console.log(`Nibiru RPC Watcher starting`);
   console.log(`Endpoint: ${RPC_URL}`);
   console.log(`Poll interval: ${POLL_INTERVAL_MS}ms`);
   console.log(`Stall threshold: ${STALL_THRESHOLD_CHECKS} checks`);
