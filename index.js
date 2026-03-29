@@ -20,7 +20,77 @@ const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorize
 let lastBlockHeight = null;
 let stallCount = 0;
 let alertSent = false;
+let consecutiveFailures = 0;
 const processStartTime = Date.now();
+
+// --- Error Classification ---
+function classifyError({ error, statusCode, responseTime }) {
+  if (!error && statusCode && statusCode >= 200 && statusCode < 300) {
+    return null; // No error
+  }
+
+  const errorStr = (error || "").toLowerCase();
+  let category, diagnosis;
+
+  if (errorStr.includes("econnrefused")) {
+    category = "CONNECTION_REFUSED";
+    diagnosis = "The server is not accepting connections. The node process is likely down or the port is not open.";
+  } else if (errorStr.includes("etimedout") || errorStr.includes("timeout") || errorStr.includes("esockettimedout")) {
+    category = "TIMEOUT";
+    diagnosis = "The server did not respond within the timeout period. The node may be overloaded or network issues may exist.";
+  } else if (errorStr.includes("econnreset")) {
+    category = "CONNECTION_RESET";
+    diagnosis = "The connection was reset by the server. This could indicate a crash, firewall drop, or proxy issue.";
+  } else if (errorStr.includes("enotfound") || errorStr.includes("dns")) {
+    category = "DNS_FAILURE";
+    diagnosis = "DNS resolution failed. The domain may be misconfigured or DNS servers may be unreachable.";
+  } else if (errorStr.includes("cert") || errorStr.includes("ssl") || errorStr.includes("tls")) {
+    category = "TLS_ERROR";
+    diagnosis = "SSL/TLS handshake failed. The certificate may be expired, invalid, or misconfigured.";
+  } else if (statusCode === 429) {
+    category = "RATE_LIMITED";
+    diagnosis = "The server is rate limiting requests. This is NOT a node outage — the node is running but rejecting excess traffic.";
+  } else if (statusCode === 502 || statusCode === 503 || statusCode === 504) {
+    category = "GATEWAY_ERROR";
+    diagnosis = `HTTP ${statusCode} — The reverse proxy/load balancer could not reach the backend node. The node process may be down behind the proxy.`;
+  } else if (statusCode && (statusCode < 200 || statusCode >= 300)) {
+    category = "HTTP_ERROR";
+    diagnosis = `Unexpected HTTP status ${statusCode}.`;
+  } else if (error) {
+    category = "UNKNOWN";
+    diagnosis = "An unclassified error occurred.";
+  }
+
+  return { category, diagnosis };
+}
+
+function formatDetailedError({ error, statusCode, responseTime, uptime, consecutiveFailures }) {
+  const classification = classifyError({ error, statusCode, responseTime });
+  if (!classification) return null;
+
+  const lines = [
+    `🔴 *Nibiru Node Down*`,
+    ``,
+    `*Error Details*`,
+    `Type: \`${classification.category}\``,
+    `Message: \`${error || "N/A"}\``,
+  ];
+
+  if (statusCode) {
+    lines.push(`HTTP Status: \`${statusCode}\``);
+  }
+
+  lines.push(
+    `Response Time: \`${responseTime}ms\``,
+    `Diagnosis: ${classification.diagnosis}`,
+    ``,
+    `*Endpoint*`,
+    `URL: \`${RPC_URL}\``,
+    `Consecutive Failures: \`${consecutiveFailures}\``,
+  );
+
+  return lines.join("\n");
+}
 
 // --- DB Setup ---
 async function initDb() {
@@ -125,6 +195,13 @@ async function poll() {
   }
 
   const responseTime = Date.now() - start;
+
+  if (isHealthy) {
+    consecutiveFailures = 0;
+  } else {
+    consecutiveFailures++;
+  }
+
   const uptime = await getUptime24h();
 
   // Stall detection
@@ -158,8 +235,9 @@ async function poll() {
 
   // Alert on down
   if (!isHealthy && !alertSent) {
+    const detailedMsg = formatDetailedError({ error, statusCode, responseTime, uptime, consecutiveFailures });
     await sendTelegramAlert(
-      `🔴 *Nibiru Node Down*\nEndpoint: \`${RPC_URL}\`\nError: ${error || "Unknown"}`,
+      detailedMsg || `🔴 *Nibiru Node Down*\nEndpoint: \`${RPC_URL}\`\nError: ${error || "Unknown"}`,
       uptime
     );
     alertSent = true;
