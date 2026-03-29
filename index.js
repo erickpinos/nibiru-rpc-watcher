@@ -421,12 +421,100 @@ function startTelegramBot() {
     }
   });
 
+  bot.onText(/\/block(?:\s+(\d+))?/, async (msg, match) => {
+    try {
+      const blockNum = match[1] ? parseInt(match[1], 10) : null;
+
+      if (!blockNum) {
+        await bot.sendMessage(msg.chat.id, "Usage: `/block <number>`\nExample: `/block 12345678`", { parse_mode: "Markdown" });
+        return;
+      }
+
+      // Check if we've ever seen this block in our logs
+      const { rows } = await pool.query(`
+        SELECT block_height, response_time_ms, status_code, is_healthy, error, timestamp, uptime_24h
+        FROM rpc_health_logs
+        WHERE block_height = $1
+        ORDER BY timestamp DESC
+      `, [blockNum]);
+
+      if (rows.length === 0) {
+        await bot.sendMessage(msg.chat.id, `❌ Block \`${blockNum}\` was never observed by this monitor. Can only look up blocks that were seen during health checks.`, { parse_mode: "Markdown" });
+        return;
+      }
+
+      const first = rows[rows.length - 1];
+      const last = rows[0];
+      const healthyCount = rows.filter(r => r.is_healthy).length;
+      const errorCount = rows.filter(r => !r.is_healthy).length;
+      const avgResponse = Math.round(rows.reduce((sum, r) => sum + (r.response_time_ms || 0), 0) / rows.length);
+
+      const lines = [
+        `📦 *Block ${blockNum} Status*`,
+        ``,
+        `*Observations*`,
+        `Times seen: \`${rows.length}\``,
+        `Healthy: \`${healthyCount}\` | Errors: \`${errorCount}\``,
+        `Avg Response: \`${avgResponse}ms\``,
+        ``,
+        `*Timeline*`,
+        `First seen: \`${new Date(first.timestamp).toISOString()}\``,
+        `Last seen: \`${new Date(last.timestamp).toISOString()}\` (${timeSince(new Date(last.timestamp))} ago)`,
+      ];
+
+      if (errorCount > 0) {
+        const errors = rows.filter(r => r.error);
+        const uniqueErrors = [...new Set(errors.map(r => r.error))];
+        lines.push(``, `*Errors at this block*`);
+        uniqueErrors.forEach(e => {
+          const classification = classifyError({ error: e, statusCode: null });
+          const type = classification ? classification.category : "UNKNOWN";
+          lines.push(`• \`${type}\`: ${e.length > 80 ? e.slice(0, 80) + "..." : e}`);
+        });
+      }
+
+      await bot.sendMessage(msg.chat.id, lines.join("\n"), { parse_mode: "Markdown" });
+    } catch (err) {
+      console.error("Error handling /block command:", err.message);
+      await bot.sendMessage(msg.chat.id, "❌ Error fetching block info. Please try again.");
+    }
+  });
+
+  bot.onText(/\/errortypes/, async (msg) => {
+    const types = [
+      [`CONNECTION_REFUSED`, `Server not accepting connections. Node process is likely down or port is closed.`],
+      [`TIMEOUT`, `Server did not respond in time. Node may be overloaded or network issues.`],
+      [`CONNECTION_RESET`, `Connection dropped mid-request. Could be a crash, firewall, or proxy issue.`],
+      [`DNS_FAILURE`, `Domain name could not be resolved. DNS misconfiguration or outage.`],
+      [`TLS_ERROR`, `SSL/TLS handshake failed. Expired or invalid certificate.`],
+      [`RATE_LIMITED`, `HTTP 429 — Node is running but rejecting excess traffic. NOT an outage.`],
+      [`GATEWAY_ERROR`, `HTTP 502/503/504 — Reverse proxy can't reach the backend node.`],
+      [`HTTP_ERROR`, `Any other unexpected HTTP status code.`],
+      [`UNKNOWN`, `Unclassified error that doesn't match known patterns.`],
+    ];
+
+    const lines = [
+      `📖 *All Monitored Error Types*`,
+      ``,
+    ];
+
+    types.forEach(([type, desc]) => {
+      lines.push(`*${type}*`, desc, ``);
+    });
+
+    lines.push(`_These categories are used in_ /errors _and_ 🔴 _down alerts._`);
+
+    await bot.sendMessage(msg.chat.id, lines.join("\n"), { parse_mode: "Markdown" });
+  });
+
   bot.onText(/\/help/, async (msg) => {
     const help = [
       "*Nibiru RPC Monitor Bot*",
       "",
       `/status - Get current node status and stats`,
       `/errors - List all error types from the last 24h`,
+      `/block <number> - Look up status of a specific block`,
+      `/errortypes - Show all possible error categories`,
       `/help - Show this help message`,
     ].join("\n");
     await bot.sendMessage(msg.chat.id, help, { parse_mode: "Markdown" });
