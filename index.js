@@ -92,6 +92,17 @@ function formatDetailedError({ error, statusCode, responseTime, uptime, consecut
   return lines.join("\n");
 }
 
+function timeSince(date) {
+  const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ${minutes % 60}m`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ${hours % 24}h`;
+}
+
 // --- DB Setup ---
 async function initDb() {
   await pool.query(`
@@ -365,11 +376,57 @@ function startTelegramBot() {
     }
   });
 
+  bot.onText(/\/errors/, async (msg) => {
+    try {
+      const { rows } = await pool.query(`
+        SELECT
+          error,
+          COUNT(*) AS count,
+          MAX(timestamp) AS last_seen
+        FROM rpc_health_logs
+        WHERE error IS NOT NULL
+          AND timestamp > NOW() - INTERVAL '24 hours'
+        GROUP BY error
+        ORDER BY count DESC
+      `);
+
+      if (rows.length === 0) {
+        await bot.sendMessage(msg.chat.id, "✅ No errors in the last 24 hours.", { parse_mode: "Markdown" });
+        return;
+      }
+
+      const totalErrors = rows.reduce((sum, r) => sum + parseInt(r.count), 0);
+      const lines = [
+        `🔴 *Errors (Last 24h)*`,
+        `Total: \`${totalErrors}\` errors across \`${rows.length}\` types`,
+        ``,
+      ];
+
+      rows.forEach((row, i) => {
+        const classification = classifyError({ error: row.error, statusCode: null });
+        const type = classification ? classification.category : "UNKNOWN";
+        const ago = timeSince(new Date(row.last_seen));
+        lines.push(
+          `*${i + 1}. ${type}* (×${row.count})`,
+          `\`${row.error.length > 120 ? row.error.slice(0, 120) + "..." : row.error}\``,
+          `Last seen: ${ago} ago`,
+          ``
+        );
+      });
+
+      await bot.sendMessage(msg.chat.id, lines.join("\n"), { parse_mode: "Markdown" });
+    } catch (err) {
+      console.error("Error handling /errors command:", err.message);
+      await bot.sendMessage(msg.chat.id, "❌ Error fetching error logs. Please try again.");
+    }
+  });
+
   bot.onText(/\/help/, async (msg) => {
     const help = [
       "*Nibiru RPC Monitor Bot*",
       "",
       `/status - Get current node status and stats`,
+      `/errors - List all error types from the last 24h`,
       `/help - Show this help message`,
     ].join("\n");
     await bot.sendMessage(msg.chat.id, help, { parse_mode: "Markdown" });
