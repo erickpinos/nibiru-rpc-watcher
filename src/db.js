@@ -30,21 +30,27 @@ function initDb() {
     )
   `);
 
+  // Prepare statements after tables exist
+  stmts.upsertBucket = db.prepare(`
+    INSERT INTO uptime_buckets (hour, healthy, total)
+    VALUES (?, ?, 1)
+    ON CONFLICT(hour) DO UPDATE SET
+      healthy = healthy + excluded.healthy,
+      total = total + 1
+  `);
+  stmts.insertEvent = db.prepare(`
+    INSERT INTO events (type, block_height, response_time_ms, status_code, error, message)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `);
+
   console.log("SQLite database ready");
 }
 
-// Uptime tracking — one row per hour
-const upsertBucket = db.prepare(`
-  INSERT INTO uptime_buckets (hour, healthy, total)
-  VALUES (?, ?, 1)
-  ON CONFLICT(hour) DO UPDATE SET
-    healthy = healthy + excluded.healthy,
-    total = total + 1
-`);
+const stmts = {};
 
 function recordCheck(isHealthy) {
-  const hour = new Date().toISOString().slice(0, 13); // "2026-04-02T10"
-  upsertBucket.run(hour, isHealthy ? 1 : 0);
+  const hour = new Date().toISOString().slice(0, 13);
+  stmts.upsertBucket.run(hour, isHealthy ? 1 : 0);
 }
 
 function getUptime(intervalHours) {
@@ -57,14 +63,8 @@ function getUptime(intervalHours) {
   return parseFloat(((row.healthy / row.total) * 100).toFixed(2));
 }
 
-// Event logging — only state changes
-const insertEvent = db.prepare(`
-  INSERT INTO events (type, block_height, response_time_ms, status_code, error, message)
-  VALUES (?, ?, ?, ?, ?, ?)
-`);
-
 function logEvent(type, { blockHeight = null, responseTime = null, statusCode = null, error = null, message = null } = {}) {
-  insertEvent.run(type, blockHeight, responseTime, statusCode, error, message);
+  stmts.insertEvent.run(type, blockHeight, responseTime, statusCode, error, message);
 }
 
 function getRecentEvents(limit = 10) {
