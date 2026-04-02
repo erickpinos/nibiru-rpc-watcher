@@ -1,5 +1,5 @@
 const { RPC_URL, POLL_INTERVAL_MS, STALL_THRESHOLD_CHECKS } = require("./src/config");
-const { pool, initDb } = require("./src/db");
+const { initDb, cleanup, close } = require("./src/db");
 const { poll } = require("./src/poller");
 const { startTelegramBot } = require("./src/bot");
 
@@ -9,11 +9,14 @@ async function main() {
   console.log(`Poll interval: ${POLL_INTERVAL_MS}ms`);
   console.log(`Stall threshold: ${STALL_THRESHOLD_CHECKS} checks`);
 
-  await initDb();
+  initDb();
   startTelegramBot();
 
   process.on("SIGTERM", shutdown);
   process.on("SIGINT", shutdown);
+
+  // Cleanup old data daily
+  setInterval(cleanup, 86400000);
 
   await poll();
 
@@ -31,9 +34,9 @@ async function main() {
   }, POLL_INTERVAL_MS);
 }
 
-async function shutdown() {
+function shutdown() {
   console.log("Shutting down gracefully...");
-  await pool.end();
+  close();
   process.exit(0);
 }
 

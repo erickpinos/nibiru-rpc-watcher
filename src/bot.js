@@ -1,42 +1,19 @@
 const fetch = require("node-fetch");
 const TelegramBot = require("node-telegram-bot-api");
 const { RPC_URL, TELEGRAM_BOT_TOKEN } = require("./config");
-const { pool, getUptime24h } = require("./db");
+const { getUptime, getRecentEvents, getErrorEvents, getErrorDetail } = require("./db");
 const { classifyError } = require("./errors");
 const { isAlertsMuted, setMute, clearMute, getMuteUntil } = require("./telegram");
 const { timeSince, formatUptime } = require("./utils");
-const { getStallCount } = require("./poller");
+const { getStallCount, getLastBlockHeight, isCurrentlyHealthy } = require("./poller");
 
 const processStartTime = Date.now();
 
-async function getNodeStatus() {
-  const uptime = await getUptime24h();
-
-  const { rows: recentLogs } = await pool.query(`
-    SELECT block_height, response_time_ms, is_healthy, timestamp
-    FROM rpc_health_logs ORDER BY timestamp DESC LIMIT 10
-  `);
-
-  const { rows: hourStats } = await pool.query(`
-    SELECT
-      COUNT(*) AS total,
-      COUNT(*) FILTER (WHERE is_healthy) AS healthy,
-      ROUND(AVG(response_time_ms)) AS avg_response,
-      MIN(response_time_ms) AS min_response,
-      MAX(response_time_ms) AS max_response,
-      MAX(block_height) AS max_block,
-      MIN(block_height) AS min_block
-    FROM rpc_health_logs
-    WHERE timestamp > NOW() - INTERVAL '1 hour'
-  `);
-
-  const h = hourStats[0] || {};
-  const latest = recentLogs[0];
-  const currentlyHealthy = latest ? latest.is_healthy : null;
-  const currentBlock = latest ? latest.block_height : null;
+function getNodeStatus() {
+  const uptime = getUptime(24);
+  const currentlyHealthy = isCurrentlyHealthy();
+  const currentBlock = getLastBlockHeight();
   const stallCount = getStallCount();
-  const blocksAdvanced = h.max_block && h.min_block
-    ? parseInt(h.max_block) - parseInt(h.min_block) : "N/A";
 
   const statusEmoji = currentlyHealthy ? "🟢" : "🔴";
   const stallStatus = stallCount > 0 ? `⚠️ ${stallCount} stall checks` : "✅ Advancing normally";
@@ -45,18 +22,15 @@ async function getNodeStatus() {
     `${statusEmoji} *Nibiru Node Status*`,
     ``,
     `*Current State*`,
-    `Health: ${currentlyHealthy ? "Online" : "Offline"}`,
+    `Health: ${currentlyHealthy ? "Online" : currentlyHealthy === null ? "Starting..." : "Offline"}`,
     `Block Height: \`${currentBlock || "N/A"}\``,
     `Block Stall: ${stallStatus}`,
     ``,
-    `*Last Hour Stats*`,
-    `Checks: ${h.total || 0} (${h.healthy || 0} healthy)`,
-    `Avg Response: \`${h.avg_response || "N/A"}ms\``,
-    `Min / Max: \`${h.min_response || "N/A"}ms\` / \`${h.max_response || "N/A"}ms\``,
-    `Blocks Advanced: \`${blocksAdvanced}\``,
-    ``,
     `*Uptime*`,
-    `24h Uptime: \`${uptime !== null ? uptime + "%" : "N/A"}\``,
+    `1h: \`${getUptime(1) ?? "N/A"}%\``,
+    `6h: \`${getUptime(6) ?? "N/A"}%\``,
+    `24h: \`${uptime !== null ? uptime + "%" : "N/A"}\``,
+    `7d: \`${getUptime(168) ?? "N/A"}%\``,
     `Monitor Uptime: \`${formatUptime(Date.now() - processStartTime)}\``,
     `Endpoint: \`${RPC_URL}\``,
   ].join("\n");
@@ -72,7 +46,7 @@ function startTelegramBot() {
 
   bot.onText(/\/status/, async (msg) => {
     try {
-      await bot.sendMessage(msg.chat.id, await getNodeStatus(), { parse_mode: "Markdown" });
+      await bot.sendMessage(msg.chat.id, getNodeStatus(), { parse_mode: "Markdown" });
     } catch (err) {
       console.error("Error handling /status command:", err.message);
       await bot.sendMessage(msg.chat.id, "❌ Error fetching node status. Please try again.");
@@ -81,20 +55,15 @@ function startTelegramBot() {
 
   bot.onText(/\/errors/, async (msg) => {
     try {
-      const { rows } = await pool.query(`
-        SELECT error, COUNT(*) AS count, MAX(timestamp) AS last_seen
-        FROM rpc_health_logs
-        WHERE error IS NOT NULL AND timestamp > NOW() - INTERVAL '24 hours'
-        GROUP BY error ORDER BY count DESC
-      `);
+      const rows = getErrorEvents(24);
 
       if (rows.length === 0) {
         await bot.sendMessage(msg.chat.id, "✅ No errors in the last 24 hours.", { parse_mode: "Markdown" });
         return;
       }
 
-      const totalErrors = rows.reduce((sum, r) => sum + parseInt(r.count), 0);
-      const lines = [`🔴 *Errors (Last 24h)*`, `Total: \`${totalErrors}\` errors across \`${rows.length}\` types`, ``];
+      const totalErrors = rows.reduce((sum, r) => sum + r.count, 0);
+      const lines = [`🔴 *Error Events (Last 24h)*`, `Total: \`${totalErrors}\` events across \`${rows.length}\` types`, ``];
 
       rows.forEach((row, i) => {
         const classification = classifyError({ error: row.error, statusCode: null });
@@ -114,20 +83,16 @@ function startTelegramBot() {
     }
   });
 
-  bot.onText(/\/error(?:\s+(\d+))?/, async (msg, match) => {
+  bot.onText(/\/error(?:\s+(\d+))?$/, async (msg, match) => {
     try {
       const n = match[1] ? parseInt(match[1], 10) : 1;
-      const { rows } = await pool.query(`
-        SELECT error, status_code, response_time_ms, block_height, timestamp
-        FROM rpc_health_logs WHERE error IS NOT NULL ORDER BY timestamp DESC LIMIT $1
-      `, [n]);
+      const row = getErrorDetail(n);
 
-      if (rows.length === 0) {
+      if (!row) {
         await bot.sendMessage(msg.chat.id, "✅ No errors recorded yet.", { parse_mode: "Markdown" });
         return;
       }
 
-      const row = rows[rows.length - 1];
       const classification = classifyError({ error: row.error, statusCode: row.status_code });
       const type = classification ? classification.category : "UNKNOWN";
       const diagnosis = classification ? classification.diagnosis : "N/A";
@@ -139,9 +104,9 @@ function startTelegramBot() {
         `*Full Error*`, `\`${row.error}\``, ``,
         `*Context*`,
         `HTTP Status: \`${row.status_code || "N/A"}\``,
-        `Response Time: \`${row.response_time_ms}ms\``,
+        `Response Time: \`${row.response_time_ms || "N/A"}ms\``,
         `Block Height: \`${row.block_height || "N/A"}\``,
-        `Timestamp: \`${new Date(row.timestamp).toISOString()}\``,
+        `Timestamp: \`${row.timestamp}\``,
       ];
 
       await bot.sendMessage(msg.chat.id, lines.join("\n"), { parse_mode: "Markdown" });
@@ -193,21 +158,12 @@ function startTelegramBot() {
 
   bot.onText(/\/uptime/, async (msg) => {
     try {
-      const intervals = [["1 hour", "1h"], ["6 hours", "6h"], ["24 hours", "24h"], ["7 days", "7d"]];
+      const intervals = [[1, "1h"], [6, "6h"], [24, "24h"], [168, "7d"]];
       const lines = [`📊 *Uptime Breakdown*`, ``];
 
-      for (const [interval, label] of intervals) {
-        const { rows } = await pool.query(`
-          SELECT COUNT(*) FILTER (WHERE is_healthy) AS healthy, COUNT(*) AS total
-          FROM rpc_health_logs WHERE timestamp > NOW() - INTERVAL '${interval}'
-        `);
-        const { healthy, total } = rows[0];
-        if (total === "0") {
-          lines.push(`${label}: \`No data\``);
-        } else {
-          const pct = ((parseInt(healthy) / parseInt(total)) * 100).toFixed(2);
-          lines.push(`${label}: \`${pct}%\` (${healthy}/${total} checks)`);
-        }
+      for (const [hours, label] of intervals) {
+        const pct = getUptime(hours);
+        lines.push(`${label}: \`${pct !== null ? pct + "%" : "No data"}\``);
       }
 
       lines.push(``, `Monitor running: \`${formatUptime(Date.now() - processStartTime)}\``);
@@ -220,32 +176,29 @@ function startTelegramBot() {
 
   bot.onText(/\/last(?:\s+(\d+))?/, async (msg, match) => {
     try {
-      const n = Math.min(parseInt(match[1] || "5", 10), 20);
-      const { rows } = await pool.query(`
-        SELECT block_height, response_time_ms, status_code, is_healthy, error, timestamp
-        FROM rpc_health_logs ORDER BY timestamp DESC LIMIT $1
-      `, [n]);
+      const n = Math.min(parseInt(match[1] || "10", 10), 50);
+      const rows = getRecentEvents(n);
 
       if (rows.length === 0) {
-        await bot.sendMessage(msg.chat.id, "No logs yet.", { parse_mode: "Markdown" });
+        await bot.sendMessage(msg.chat.id, "No events yet.", { parse_mode: "Markdown" });
         return;
       }
 
-      const lines = [`📋 *Last ${rows.length} Checks*`, ``];
+      const typeIcons = { down: "🔴", recovery: "✅", stall: "⚠️", stall_recovery: "✅" };
+      const lines = [`📋 *Last ${rows.length} Events*`, ``];
       rows.forEach(row => {
-        const icon = row.is_healthy ? "✅" : "🔴";
+        const icon = typeIcons[row.type] || "ℹ️";
         const ago = timeSince(new Date(row.timestamp));
         const block = row.block_height || "—";
-        const errSnip = row.error
-          ? ` \`${row.error.length > 50 ? row.error.slice(0, 50) + "..." : row.error}\``
-          : "";
-        lines.push(`${icon} ${ago} ago | blk \`${block}\` | \`${row.response_time_ms}ms\`${errSnip}`);
+        const detail = row.message || row.error || "";
+        const detailSnip = detail.length > 60 ? detail.slice(0, 60) + "..." : detail;
+        lines.push(`${icon} \`${row.type}\` ${ago} ago | blk \`${block}\`${detailSnip ? " | " + detailSnip : ""}`);
       });
 
       await bot.sendMessage(msg.chat.id, lines.join("\n"), { parse_mode: "Markdown" });
     } catch (err) {
       console.error("Error handling /last command:", err.message);
-      await bot.sendMessage(msg.chat.id, "❌ Error fetching logs. Please try again.");
+      await bot.sendMessage(msg.chat.id, "❌ Error fetching events. Please try again.");
     }
   });
 
@@ -258,52 +211,6 @@ function startTelegramBot() {
   bot.onText(/\/unmute/, async (msg) => {
     clearMute();
     await bot.sendMessage(msg.chat.id, `🔔 Alerts re-enabled.`, { parse_mode: "Markdown" });
-  });
-
-  bot.onText(/\/response/, async (msg) => {
-    try {
-      const { rows } = await pool.query(`
-        SELECT interval_label, ROUND(avg_ms) AS avg_ms, min_ms, max_ms, ROUND(p95_ms) AS p95_ms, total
-        FROM (
-          SELECT '1h' AS interval_label, 1 AS sort_order,
-            AVG(response_time_ms) AS avg_ms, MIN(response_time_ms) AS min_ms,
-            MAX(response_time_ms) AS max_ms,
-            PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY response_time_ms) AS p95_ms,
-            COUNT(*) AS total
-          FROM rpc_health_logs WHERE timestamp > NOW() - INTERVAL '1 hour'
-          UNION ALL
-          SELECT '24h', 2, AVG(response_time_ms), MIN(response_time_ms),
-            MAX(response_time_ms),
-            PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY response_time_ms),
-            COUNT(*)
-          FROM rpc_health_logs WHERE timestamp > NOW() - INTERVAL '24 hours'
-          UNION ALL
-          SELECT '7d', 3, AVG(response_time_ms), MIN(response_time_ms),
-            MAX(response_time_ms),
-            PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY response_time_ms),
-            COUNT(*)
-          FROM rpc_health_logs WHERE timestamp > NOW() - INTERVAL '7 days'
-        ) sub ORDER BY sort_order
-      `);
-
-      const lines = [`⏱ *Response Time Stats*`, ``];
-      rows.forEach(r => {
-        if (parseInt(r.total) === 0) {
-          lines.push(`*${r.interval_label}*: No data`, ``);
-        } else {
-          lines.push(
-            `*${r.interval_label}* (${r.total} checks)`,
-            `Avg: \`${r.avg_ms}ms\` | P95: \`${r.p95_ms}ms\``,
-            `Min: \`${r.min_ms}ms\` | Max: \`${r.max_ms}ms\``, ``
-          );
-        }
-      });
-
-      await bot.sendMessage(msg.chat.id, lines.join("\n"), { parse_mode: "Markdown" });
-    } catch (err) {
-      console.error("Error handling /response command:", err.message);
-      await bot.sendMessage(msg.chat.id, "❌ Error fetching response stats. Please try again.");
-    }
   });
 
   bot.onText(/\/errortypes/, async (msg) => {
@@ -333,16 +240,15 @@ function startTelegramBot() {
     const help = [
       "*Nibiru RPC Monitor Bot*", "",
       `*Monitoring*`,
-      `/status - Current node status and stats`,
+      `/status - Current node status and uptime`,
       `/ping - Live check right now`,
       `/uptime - Uptime breakdown (1h, 6h, 24h, 7d)`,
-      `/response - Response time stats with P95`,
       ``, `*Errors*`,
-      `/errors - Error summary from the last 24h`,
+      `/errors - Error events from the last 24h`,
       `/error <n> - Full detail of nth most recent error`,
       `/errortypes - Reference of all error categories`,
-      ``, `*Logs*`,
-      `/last <n> - Last n health checks (default 5, max 20)`,
+      ``, `*Events*`,
+      `/last <n> - Last n events (default 10, max 50)`,
       ``, `*Alerts*`,
       `/mute <min> - Mute alerts for n minutes (default 60)`,
       `/unmute - Re-enable alerts`,
@@ -351,7 +257,7 @@ function startTelegramBot() {
   });
 
   bot.on("polling_error", (err) => console.error("Telegram polling error:", err.message));
-  console.log("Telegram bot started, listening for /status commands");
+  console.log("Telegram bot started, listening for commands");
 }
 
 module.exports = { startTelegramBot };
