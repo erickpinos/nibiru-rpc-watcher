@@ -1,6 +1,7 @@
-const { RPC_URL, POLL_INTERVAL_MS, STALL_THRESHOLD_CHECKS } = require("./src/config");
+const { RPC_URL, POLL_INTERVAL_MS, STALL_THRESHOLD_CHECKS, PEG_CHECK_INTERVAL_MS } = require("./src/config");
 const { initDb, cleanup, close } = require("./src/db");
 const { poll } = require("./src/poller");
+const { checkPeg } = require("./src/pegcheck");
 const { startTelegramBot } = require("./src/bot");
 
 async function main() {
@@ -17,6 +18,13 @@ async function main() {
 
   // Cleanup old data daily
   setInterval(cleanup, 86400000);
+
+  // USDC.e FunToken peg check: escrow vs bank-mirror supply, once at boot then daily
+  console.log(`Peg check interval: ${PEG_CHECK_INTERVAL_MS}ms`);
+  checkPeg().catch((err) => console.error("Peg check (startup) error:", err.message));
+  setInterval(() => {
+    checkPeg().catch((err) => console.error("Peg check error:", err.message));
+  }, PEG_CHECK_INTERVAL_MS);
 
   await poll();
 

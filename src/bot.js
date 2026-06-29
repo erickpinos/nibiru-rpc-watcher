@@ -1,11 +1,12 @@
 const fetch = require("node-fetch");
 const TelegramBot = require("node-telegram-bot-api");
-const { RPC_URL, TELEGRAM_BOT_TOKEN } = require("./config");
-const { getUptime, getRecentEvents, getErrorEvents, getErrorDetail } = require("./db");
+const { RPC_URL, TELEGRAM_BOT_TOKEN, BANK_MIRROR_DENOM } = require("./config");
+const { getUptime, getRecentEvents, getErrorEvents, getErrorDetail, getLatestPeg } = require("./db");
 const { classifyError } = require("./errors");
 const { isAlertsMuted, setMute, clearMute, getMuteUntil } = require("./telegram");
 const { timeSince, formatUptime } = require("./utils");
 const { getStallCount, getLastBlockHeight, isCurrentlyHealthy } = require("./poller");
+const { checkPeg, fmt } = require("./pegcheck");
 
 const processStartTime = Date.now();
 
@@ -156,6 +157,39 @@ function startTelegramBot() {
     }
   });
 
+  bot.onText(/\/peg/, async (msg) => {
+    try {
+      await bot.sendMessage(msg.chat.id, "🔎 Checking USDC.e peg (live)…", { parse_mode: "Markdown" });
+      const r = await checkPeg();
+      if (!r) {
+        const cached = getLatestPeg();
+        const note = cached
+          ? `\nLast good reading (${timeSince(new Date(cached.timestamp))} ago): escrow \`${fmt(BigInt(cached.escrow))}\` vs supply \`${fmt(BigInt(cached.mirror))}\``
+          : "";
+        await bot.sendMessage(msg.chat.id, `⚠️ Live peg read failed (chain unreachable).${note}`, { parse_mode: "Markdown" });
+        return;
+      }
+      const icon = r.healthy ? "🟢" : "🔴";
+      const verdict = r.healthy
+        ? "Fully backed — bank coins match escrowed USDC.e."
+        : "BREACH — bank coins exceed escrowed USDC.e!";
+      const lines = [
+        `${icon} *USDC.e Peg Check*`,
+        verdict,
+        ``,
+        `Escrow (EVM module): \`${fmt(r.escrow)}\` USDC.e`,
+        `Bank-mirror supply:  \`${fmt(r.mirror)}\` USDC.e`,
+        `Drift:               \`${fmt(r.drift)}\` USDC.e`,
+        ``,
+        `Denom: \`${BANK_MIRROR_DENOM}\``,
+      ];
+      await bot.sendMessage(msg.chat.id, lines.join("\n"), { parse_mode: "Markdown" });
+    } catch (err) {
+      console.error("Error handling /peg command:", err.message);
+      await bot.sendMessage(msg.chat.id, "❌ Error running peg check. Please try again.");
+    }
+  });
+
   bot.onText(/\/uptime/, async (msg) => {
     try {
       const intervals = [[1, "1h"], [6, "6h"], [24, "24h"], [168, "7d"]];
@@ -242,6 +276,7 @@ function startTelegramBot() {
       `*Monitoring*`,
       `/status - Current node status and uptime`,
       `/ping - Live check right now`,
+      `/peg - USDC.e escrow vs bank-mirror supply (live)`,
       `/uptime - Uptime breakdown (1h, 6h, 24h, 7d)`,
       ``, `*Errors*`,
       `/errors - Error events from the last 24h`,
